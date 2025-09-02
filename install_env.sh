@@ -18,7 +18,8 @@
 # Exit on error
 set -e
 
-CONDA_ENV=${1:-"3dgrut"}
+UV_ENV=${1:-"3dgrut"}
+CUDA_VERSION=${2:-"12.8.1"}
 
 # parse an optional second arg WITH_GCC11 to also manually use gcc-11 within the environment
 WITH_GCC11=false
@@ -32,7 +33,7 @@ CUDA_VERSION=${CUDA_VERSION:-"11.8.0"}
 
 # Verify user arguments
 echo "Arguments:"
-echo "  CONDA_ENV: $CONDA_ENV"
+echo "  UV_ENV: $UV_ENV"
 echo "  WITH_GCC11: $WITH_GCC11"
 echo "  CUDA_VERSION: $CUDA_VERSION"
 echo ""
@@ -62,8 +63,9 @@ if [ ! "$WITH_GCC11" = true ]; then
     # Make sure gcc is at most 11 for nvcc compatibility
     gcc_version=$(gcc -dumpversion)
     if [ "$gcc_version" -gt 11 ]; then
-        echo "Default gcc version $gcc_version is higher than 11. See note about installing gcc-11 (you may need 'sudo apt-get install gcc-11 g++-11') and rerun with ./install_env.sh 3dgrut WITH_GCC11"
-        exit 1
+        echo "Default gcc version $gcc_version is higher than 11. CUDA requires GCC 11 or lower."
+        echo "The script will automatically install gcc-11 and g++-11 for CUDA compatibility."
+        echo "Alternatively, you can rerun with: ./install_env.sh 3dgrut WITH_GCC11"
     fi
 fi
 
@@ -85,27 +87,24 @@ if [ "$WITH_GCC11" = true ]; then
     GXX_11_PATH=$(which g++-11)
 fi
 
-# Create and activate conda environment
-eval "$(conda shell.bash hook)"
+# Create and activate uv environment
+UV_ENV_PATH="./.venv"
 
-# Finds the path of the environment if the environment already exists
-CONDA_ENV_PATH=$(conda env list | sed -E -n "s/^${CONDA_ENV}[[:space:]]+\*?[[:space:]]*(.*)$/\1/p")
-if [ -z "${CONDA_ENV_PATH}" ]; then
-  echo "Conda environment '${CONDA_ENV}' not found, creating it"
-  conda create --name ${CONDA_ENV} -y python=3.11
+if [ ! -d "${UV_ENV_PATH}" ]; then
+  echo "UV environment not found, creating it"
+  uv venv --python 3.11
 else
-  echo "NOTE: Conda environment '${CONDA_ENV}' already exists at ${CONDA_ENV_PATH}, skipping environment creation"
+  echo "NOTE: UV environment already exists at ${UV_ENV_PATH}, skipping environment creation"
 fi
-conda activate $CONDA_ENV
 
-# Set CC and CXX variables to gcc11 in the conda env
+# Activate the uv environment
+source ${UV_ENV_PATH}/bin/activate
+
+# Set CC and CXX variables to gcc11 in the environment
 if [ "$WITH_GCC11" = true ]; then
-    echo "Setting CC=$GCC_11_PATH and CXX=$GXX_11_PATH in conda environment"
-
-    conda env config vars set CC=$GCC_11_PATH CXX=$GXX_11_PATH
-
-    conda deactivate
-    conda activate $CONDA_ENV
+    echo "Setting CC=$GCC_11_PATH and CXX=$GXX_11_PATH in environment"
+    export CC=$GCC_11_PATH
+    export CXX=$GXX_11_PATH
 
     # Make sure it worked
     gcc_version=$($CC -dumpversion | cut -d '.' -f 1)
@@ -116,17 +115,33 @@ if [ "$WITH_GCC11" = true ]; then
     fi
 fi
 
-conda env config vars set TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST
-conda deactivate
-conda activate $CONDA_ENV
+# Set TORCH_CUDA_ARCH_LIST environment variable
+export TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST
 
 # Install CUDA and PyTorch dependencies
 # CUDA 11.8 supports until compute capability 9.0
 if [ "$CUDA_VERSION" = "11.8.0" ]; then
     echo "Installing CUDA 11.8.0 ..."
-    conda install -y cuda-toolkit cmake ninja -c nvidia/label/cuda-11.8.0
-    conda install -y pytorch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 pytorch-cuda=11.8 "numpy<2.0" -c pytorch -c nvidia/label/cuda-11.8.0
-    pip3 install --find-links https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.1.2_cu118.html kaolin==0.17.0
+    # Install system dependencies via apt (assuming Ubuntu/Debian)
+    sudo apt-get update
+    sudo apt-get install -y cmake ninja-build
+    
+    # Check if CUDA runtime is available from NVIDIA driver
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        echo "NVIDIA driver detected. Checking CUDA runtime availability..."
+        nvidia-smi | grep -q "CUDA Version" && echo "CUDA runtime available from driver" || echo "CUDA runtime not detected"
+    fi
+    
+    # Install CUDA toolkit for compilation (already installed via apt)
+    echo "Setting up CUDA environment..."
+    export CUDA_HOME=/usr/local/cuda-11.8
+    export PATH=$CUDA_HOME/bin:$PATH
+    export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+    
+    # Install PyTorch with CUDA 11.8 support using uv's torch-backend
+    uv pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --torch-backend cu118
+    uv pip install "numpy<2.0"
+    uv pip install --find-links https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.1.2_cu118.html kaolin==0.17.0
 
 # CUDA 12.8 supports compute capability 10.0 and 12.0
 elif [ "$CUDA_VERSION" = "12.8.1" ]; then
@@ -141,9 +156,19 @@ elif [ "$CUDA_VERSION" = "12.8.1" ]; then
     gcc_version=$($GCC_11_PATH -dumpversion | cut -d '.' -f 1)
 
     echo "Installing CUDA 12.8.1 ..."
-    conda install -y cuda-toolkit cmake ninja gcc_linux-64=$gcc_version -c nvidia/label/cuda-12.8.1
-    pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-    pip3 install --force-reinstall "numpy<2"
+    # Install system dependencies via apt (assuming Ubuntu/Debian)
+    sudo apt-get update
+    sudo apt-get install -y cmake ninja-build gcc-${gcc_version} g++-${gcc_version}
+    
+    # Set up CUDA environment (already installed via apt)
+    echo "Setting up CUDA environment..."
+    export CUDA_HOME=/usr/local/cuda-12.8
+    export PATH=$CUDA_HOME/bin:$PATH
+    export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+    
+    # Install PyTorch with CUDA 12.8 support using uv's torch-backend
+    uv pip install torch torchvision torchaudio --torch-backend cu128
+    uv pip install --force-reinstall "numpy<2"
 
     # TODO move to using wheel once kaolin is available
     rm -fr thirdparty/kaolin
@@ -151,9 +176,9 @@ elif [ "$CUDA_VERSION" = "12.8.1" ]; then
     pushd thirdparty/kaolin
     git checkout c2da967b9e0d8e3ebdbd65d3e8464d7e39005203  # ping to a fixed commit for reproducibility
     sed -i 's!AT_DISPATCH_FLOATING_TYPES_AND_HALF(feats_in.type()!AT_DISPATCH_FLOATING_TYPES_AND_HALF(feats_in.scalar_type()!g' kaolin/csrc/render/spc/raytrace_cuda.cu
-    pip install --upgrade pip
-    pip install --no-cache-dir ninja imageio imageio-ffmpeg
-    pip install --no-cache-dir        \
+    uv pip install --upgrade pip
+    uv pip install --no-cache-dir ninja imageio imageio-ffmpeg
+    uv pip install --no-cache-dir        \
         -r tools/viz_requirements.txt \
         -r tools/requirements.txt     \
         -r tools/build_requirements.txt
@@ -168,11 +193,11 @@ else
 fi
 
 # Install OpenGL headers for the playground
-conda install -c conda-forge mesa-libgl-devel-cos7-x86_64 -y 
+sudo apt-get install -y libgl1-mesa-dev libglu1-mesa-dev
 
 # Initialize git submodules and install Python requirements
 git submodule update --init --recursive
-pip install -r requirements.txt
-pip install -e .
+uv pip install -r requirements.txt
+uv pip install -e .
 
 echo "Setup completed successfully!"
